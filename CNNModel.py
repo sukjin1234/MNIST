@@ -29,28 +29,59 @@ train_loader = DataLoader(dataset=train_dataset, batch_size = 32, shuffle=True)
 # 테스트용 DataLoader 생성 (데이터를 섞지 않음)
 test_loader = DataLoader(dataset=test_dataset, batch_size = 32, shuffle=False)
 
+DROPOUT_FEATURE = 0.1
+DROPOUT_CLASSIFIER = 0.3
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, stride=stride)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.relu2 = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout2d(DROPOUT_FEATURE)
+        
+        # Skip connection
+        if in_channels != out_channels or stride != 1:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride),
+                nn.BatchNorm2d(out_channels)
+            )
+        else:
+            self.shortcut = nn.Identity()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = self.shortcut(x)
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu1(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.dropout(out)
+        out = out + identity
+        out = self.relu2(out)
+        return out
+
 
 class SimpleCNN(nn.Module):
     def __init__(self, num_classes: int = 10):
         super().__init__()
         # 입력: [B, 1, 28, 28]
         self.features = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),  # -> [B, 32, 14, 14]
-
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),  # -> [B, 64, 7, 7]
-            
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),  # -> [B, 128, 3, 3]
+            ResidualBlock(1, 32, stride=2),   # -> [B, 32, 14, 14]
+            ResidualBlock(32, 64, stride=2),  # -> [B, 64, 7, 7]
+            ResidualBlock(64, 128, stride=2), # -> [B, 128, 4, 4] (실제 크기)
+            nn.AdaptiveAvgPool2d((3, 3)),     # -> [B, 128, 3, 3] (고정 크기로 변환)
         )
         self.classifier = nn.Sequential(
             nn.Flatten(),
+            nn.Dropout(DROPOUT_CLASSIFIER),
             nn.Linear(128 * 3 * 3, 128),
             nn.ReLU(inplace=True),
+            nn.Dropout(DROPOUT_CLASSIFIER),
             nn.Linear(128, num_classes),
         )
 
@@ -263,7 +294,7 @@ def main() -> None:
 
     model = SimpleCNN().to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     
     # 학습률 탐색
     print("학습률 탐색 중...")
