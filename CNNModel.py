@@ -67,26 +67,70 @@ class ResidualBlock(nn.Module):
 
 
 class SimpleCNN(nn.Module):
-    def __init__(self, num_classes: int = 10):
+    def __init__(self, num_classes: int = 10, num_blocks: int = 3, 
+                 base_channels: int = 32, width_scale: float = 2.0,
+                 channels: List[int] = None):
+        """
+        Args:
+            num_classes: 출력 클래스 개수
+            num_blocks: ResidualBlock의 개수 (깊이)
+            base_channels: 첫 번째 블록의 출력 채널 수 (너비 기본값)
+            width_scale: 각 블록마다 채널 수를 늘리는 배율
+            channels: 명시적으로 채널 수 리스트 지정 (None이면 base_channels와 width_scale로 계산)
+        """
         super().__init__()
-        # 입력: [B, 1, 28, 28]
-        self.features = nn.Sequential(
-            ResidualBlock(1, 32, stride=2),   # -> [B, 32, 14, 14]
-            ResidualBlock(32, 64, stride=2),  # -> [B, 64, 7, 7]
-            ResidualBlock(64, 128, stride=2), # -> [B, 128, 4, 4] (실제 크기)
-            nn.AdaptiveAvgPool2d((3, 3)),     # -> [B, 128, 3, 3] (고정 크기로 변환)
-        )
+        
+        # 채널 수 계산
+        if channels is None:
+            # base_channels부터 시작해서 width_scale만큼 늘려가며 계산
+            channels = [int(base_channels * (width_scale ** i)) for i in range(num_blocks)]
+        else:
+            # 명시적으로 채널 수가 주어진 경우
+            num_blocks = len(channels)
+        
+        # 입력 채널: MNIST는 1채널
+        in_channels = 1
+        
+        # ResidualBlock들을 동적으로 생성
+        self.blocks = nn.ModuleList()
+        for i, out_channels in enumerate(channels):
+            # 모든 블록에 stride=2 적용 (다운샘플링)
+            # 입력: 28x28 -> 블록1: 14x14 -> 블록2: 7x7 -> 블록3: 4x4 (또는 3x3)
+            stride = 2
+            self.blocks.append(ResidualBlock(in_channels, out_channels, stride=stride))
+            in_channels = out_channels
+        
+        # AdaptiveAvgPool2d로 고정 크기로 변환
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((3, 3))
+        
+        # 최종 채널 수 계산 (마지막 블록의 출력 채널)
+        final_channels = channels[-1]
+        feature_dim = final_channels * 3 * 3  # AdaptiveAvgPool2d(3,3) 이후 크기
+        
+        # Classifier: 특징 차원을 적절히 조절
+        classifier_hidden = max(128, final_channels // 2)  # 최소 128, 또는 채널의 절반
+        
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Dropout(DROPOUT_CLASSIFIER),
-            nn.Linear(128 * 3 * 3, 128),
+            nn.Linear(feature_dim, classifier_hidden),
             nn.ReLU(inplace=True),
             nn.Dropout(DROPOUT_CLASSIFIER),
-            nn.Linear(128, num_classes),
+            nn.Linear(classifier_hidden, num_classes),
         )
+        
+        # 디버깅용 정보 저장
+        self.num_blocks = num_blocks
+        self.channels = channels
+        self.feature_dim = feature_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.features(x)
+        # ResidualBlock들을 순차적으로 통과
+        for block in self.blocks:
+            x = block(x)
+        # 고정 크기로 변환
+        x = self.adaptive_pool(x)
+        # Classifier 통과
         x = self.classifier(x)
         return x
 
@@ -287,12 +331,52 @@ def plot_training_history(train_losses: List[float], train_accs: List[float],
     plt.show()
 
 
+# ============================================================================
+# 사용 예시:
+# ============================================================================
+# 
+# # 작은 모델 (얕고 좁음): 2개 블록, 기본 채널 16
+# small_model = SimpleCNN(num_blocks=2, base_channels=16, width_scale=2.0)
+# 
+# # 기본 모델 (기존 설정과 동일): 3개 블록, 기본 채널 32
+# default_model = SimpleCNN()  # 또는 SimpleCNN(num_blocks=3, base_channels=32, width_scale=2.0)
+# 
+# # 큰 모델 (깊고 넓음): 5개 블록, 기본 채널 64
+# large_model = SimpleCNN(num_blocks=5, base_channels=64, width_scale=1.5)
+# 
+# # 매우 큰 모델 (매우 깊고 매우 넓음): 6개 블록, 기본 채널 128
+# huge_model = SimpleCNN(num_blocks=6, base_channels=128, width_scale=1.5)
+# 
+# # 명시적으로 채널 수 지정
+# custom_model = SimpleCNN(channels=[32, 48, 64, 96, 128])  # num_blocks는 자동으로 5로 설정됨
+# 
+# ============================================================================
+
+
 def main() -> None:
     torch.manual_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    # 기본 모델 생성 (기존과 동일한 설정)
+    # 다른 설정을 테스트하려면 아래 예시를 참고:
+    # - 작은 모델: SimpleCNN(num_blocks=2, base_channels=16)
+    # - 큰 모델: SimpleCNN(num_blocks=5, base_channels=64, width_scale=1.5)
+    # - 사용자 정의: SimpleCNN(channels=[32, 64, 128, 256])
     model = SimpleCNN().to(device)
+    
+    # 모델 구조 정보 출력
+    print(f"\n모델 구조:")
+    print(f"  - 블록 개수 (깊이): {model.num_blocks}")
+    print(f"  - 채널 수 (너비): {model.channels}")
+    print(f"  - 특징 벡터 차원: {model.feature_dim}")
+    
+    # 모델 파라미터 개수 계산
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  - 총 파라미터 수: {total_params:,}")
+    print(f"  - 학습 가능 파라미터: {trainable_params:,}\n")
+    
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     
