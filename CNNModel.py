@@ -363,7 +363,7 @@ def main() -> None:
     # - 작은 모델: SimpleCNN(num_blocks=2, base_channels=16)
     # - 큰 모델: SimpleCNN(num_blocks=5, base_channels=64, width_scale=1.5)
     # - 사용자 정의: SimpleCNN(channels=[32, 64, 128, 256])
-    model = SimpleCNN().to(device)
+    model = SimpleCNN(num_blocks=2, base_channels=16, width_scale=2.0).to(device)
     
     # 모델 구조 정보 출력
     print(f"\n모델 구조:")
@@ -445,6 +445,21 @@ def main() -> None:
             break
     
     print(f"\n최고 검증 정확도: {best_val_acc*100:.2f}%")
+    
+    # 모델 저장
+    model_save_path = "mnist_cnn_model.pth"
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'model_config': {
+            'num_blocks': model.num_blocks,
+            'channels': model.channels,
+            'num_classes': 10
+        },
+        'best_val_acc': best_val_acc,
+        'transform_mean': 0.1307,
+        'transform_std': 0.3081
+    }, model_save_path)
+    print(f"모델이 저장되었습니다: {model_save_path}")
     
     # 학습 과정 시각화
     plot_training_history(train_losses, train_accs, val_losses, val_accs)
