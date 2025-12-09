@@ -7,7 +7,7 @@ import torch.optim as optim
 import matplotlib.pyplot as plt
 import numpy as np
 from typing import List, Tuple
-import math
+import copy
 
 # 데이터 전처리 규칙 정의
 transform = transforms.Compose([
@@ -23,11 +23,28 @@ train_dataset = MNIST(root='./data', train=True, transform=transform, download=T
 # 테스트용 데이터셋 불러오기
 test_dataset = MNIST(root='./data', train=False, transform=transform, download=True)
 
+# GPU 사용 가능 여부 확인
+use_gpu = torch.cuda.is_available()
+
 # 학습용 DataLoader 생성 (데이터를 섞음)
-train_loader = DataLoader(dataset=train_dataset, batch_size = 32, shuffle=True)
+# GPU 사용 시 pin_memory=True로 설정하여 데이터 전송 속도 향상
+# Windows에서는 num_workers=0이 더 안정적일 수 있음
+train_loader = DataLoader(
+    dataset=train_dataset, 
+    batch_size=32, 
+    shuffle=True,
+    num_workers=2,  # Windows 호환성을 위해 0으로 설정 (필요시 조정 가능)
+    pin_memory=True if use_gpu else False  # GPU 사용 시 메모리 고정으로 전송 속도 향상
+)
 
 # 테스트용 DataLoader 생성 (데이터를 섞지 않음)
-test_loader = DataLoader(dataset=test_dataset, batch_size = 32, shuffle=False)
+test_loader = DataLoader(
+    dataset=test_dataset, 
+    batch_size=32, 
+    shuffle=False,
+    num_workers=0,
+    pin_memory=True if use_gpu else False
+)
 
 DROPOUT_FEATURE = 0.1
 DROPOUT_CLASSIFIER = 0.3
@@ -169,20 +186,18 @@ class LearningRateFinder:
         self.device = device
         
     def find_lr(self, dataloader: DataLoader, start_lr: float = 1e-7, end_lr: float = 10, num_iter: int = 100) -> Tuple[List[float], List[float]]:
+        # [수정됨 1] 탐색 시작 전 모델과 옵티마이저 상태 백업
+        initial_model_state = copy.deepcopy(self.model.state_dict())
+        initial_optimizer_state = copy.deepcopy(self.optimizer.state_dict())
+
         lrs = []
         losses = []
-        
-        # 원래 학습률 저장
-        original_lr = self.optimizer.param_groups[0]['lr']
-        
-        # 학습률 범위 설정
         lr_mult = (end_lr / start_lr) ** (1 / num_iter)
         
-        # 모델을 학습 모드로 설정
         self.model.train()
-        
-        # 데이터로더에서 배치 가져오기
         data_iter = iter(dataloader)
+        
+        current_lr = start_lr
         
         for i in range(num_iter):
             try:
@@ -194,31 +209,29 @@ class LearningRateFinder:
             inputs = inputs.to(self.device)
             targets = targets.to(self.device)
             
-            # 현재 학습률 계산
+            # 현재 학습률 설정
             current_lr = start_lr * (lr_mult ** i)
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = current_lr
             
-            # 순전파
             self.optimizer.zero_grad()
             outputs = self.model(inputs)
             loss = self.criterion(outputs, targets)
-            
-            # 역전파
             loss.backward()
             self.optimizer.step()
             
             lrs.append(current_lr)
             losses.append(loss.item())
             
-            # 손실이 너무 커지면 중단
-            if loss.item() > 4 * min(losses):
+            # 손실이 폭발하면 중단 (최소값의 4배 이상)
+            if i > 0 and loss.item() > 4 * min(losses):
                 break
         
-        # 원래 학습률 복원
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = original_lr
-            
+        # [수정됨 2] 탐색이 끝나면 모델을 백업해둔 깨끗한 상태로 복구
+        print("LR 탐색 완료. 모델 상태를 초기화합니다.")
+        self.model.load_state_dict(initial_model_state)
+        self.optimizer.load_state_dict(initial_optimizer_state)
+        
         return lrs, losses
 
 
@@ -354,9 +367,31 @@ def plot_training_history(train_losses: List[float], train_accs: List[float],
 
 
 def main() -> None:
-    torch.manual_seed(42)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    import random
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # GPU 사용 가능 여부 확인 및 설정
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print(f"GPU 사용 가능: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA 버전: {torch.version.cuda}")
+        print(f"GPU 메모리: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+        # GPU 시드 설정
+        torch.cuda.manual_seed(42)
+        torch.cuda.manual_seed_all(42)
+    else:
+        device = torch.device("cpu")
+        print("경고: GPU를 사용할 수 없습니다. CPU로 실행됩니다.")
+        print("GPU를 사용하려면 CUDA가 설치된 PyTorch를 설치하세요.")
+    
+    print(f"사용 중인 디바이스: {device}\n")
 
     # 기본 모델 생성 (기존과 동일한 설정)
     # 다른 설정을 테스트하려면 아래 예시를 참고:
@@ -383,7 +418,7 @@ def main() -> None:
     # 학습률 탐색
     print("학습률 탐색 중...")
     lr_finder = LearningRateFinder(model, optimizer, criterion, device)
-    lrs, losses = lr_finder.find_lr(train_loader, start_lr=1e-7, end_lr=1, num_iter=200)
+    lrs, losses = lr_finder.find_lr(train_loader, start_lr=1e-7, end_lr=10, num_iter=100) # end_lr 범위를 좀 더 넓힘
     
     # 최적 학습률 추정
     if len(losses) > 10:
@@ -391,8 +426,13 @@ def main() -> None:
         smoothed_lrs = lrs[9:]
         if len(smoothed_losses) > 0:
             min_idx = np.argmin(smoothed_losses)
-            optimal_lr = smoothed_lrs[min_idx]
-            print(f"추정된 최적 학습률: {optimal_lr:.2e}")
+            min_loss_lr = smoothed_lrs[min_idx]
+            
+            # [수정됨 4] 안전한 학습률 선택 (최소 지점의 1/10)
+            optimal_lr = min_loss_lr / 10
+            
+            print(f"Loss 최소 지점: {min_loss_lr:.2e}")
+            print(f"최종 선택된 Optimal LR (안전 마진 적용): {optimal_lr:.2e}")
             
             # 최적 학습률로 설정
             for param_group in optimizer.param_groups:
@@ -429,6 +469,20 @@ def main() -> None:
         # 최고 성능 업데이트
         if val_acc > best_val_acc:
             best_val_acc = val_acc
+            # 모델 저장
+            model_save_path = "C:\Projects\MNIST\mnist_cnn_model.pth"
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'model_config': {
+                    'num_blocks': model.num_blocks,
+                    'channels': model.channels,
+                    'num_classes': 10
+                },
+                'best_val_acc': best_val_acc,
+                'transform_mean': 0.1307,
+                'transform_std': 0.3081
+            }, model_save_path)
+            print(f"모델이 저장되었습니다: {model_save_path}")
         
         # 스케줄러 업데이트 (검증 손실 기반)
         scheduler.step(val_loss)
@@ -445,21 +499,6 @@ def main() -> None:
             break
     
     print(f"\n최고 검증 정확도: {best_val_acc*100:.2f}%")
-    
-    # 모델 저장
-    model_save_path = "mnist_cnn_model.pth"
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'model_config': {
-            'num_blocks': model.num_blocks,
-            'channels': model.channels,
-            'num_classes': 10
-        },
-        'best_val_acc': best_val_acc,
-        'transform_mean': 0.1307,
-        'transform_std': 0.3081
-    }, model_save_path)
-    print(f"모델이 저장되었습니다: {model_save_path}")
     
     # 학습 과정 시각화
     plot_training_history(train_losses, train_accs, val_losses, val_accs)
